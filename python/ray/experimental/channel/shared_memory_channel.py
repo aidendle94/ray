@@ -644,6 +644,73 @@ class BufferedSharedMemoryChannel(ChannelInterface):
         return self._next_read_index
 
 
+class RemoteChannelPool(ChannelInterface):
+    """
+    A pool of K independent remote Channels to the same set of readers on
+    different nodes. This provides K logical slots per remote edge by
+    round-robin write/read across underlying Channels.
+
+    Semantics mirror BufferedSharedMemoryChannel but target cross-node readers.
+    """
+
+    def __init__(
+        self,
+        writer: Optional[ray.actor.ActorHandle],
+        reader_and_node_list: List[Tuple["ray.actor.ActorHandle", str]],
+        num_remote_buffers: int,
+        typ: Optional[Union[int, SharedMemoryType]] = None,
+    ):
+        self._num_remote_buffers = num_remote_buffers
+        self._buffers = [
+            Channel(writer, reader_and_node_list, typ) for _ in range(num_remote_buffers)
+        ]
+        # The next index to write from self._buffers.
+        self._next_write_index = 0
+        # The next index to read from self._buffers.
+        self._next_read_index = 0
+
+    def ensure_registered_as_writer(self):
+        for buffer in self._buffers:
+            buffer.ensure_registered_as_writer()
+
+    def ensure_registered_as_reader(self):
+        for buffer in self._buffers:
+            buffer.ensure_registered_as_reader()
+
+    def write(self, value: Any, timeout: Optional[float] = None) -> None:
+        # A single channel is not supposed to read and write at the same time.
+        assert self._next_read_index == 0
+        self._buffers[self._next_write_index].write(value, timeout)
+        self._next_write_index = (self._next_write_index + 1) % self._num_remote_buffers
+
+    def read(self, timeout: Optional[float] = None) -> Any:
+        # A single channel is not supposed to read and write at the same time.
+        assert self._next_write_index == 0
+        output = self._buffers[self._next_read_index].read(timeout)
+        self._next_read_index = (self._next_read_index + 1) % self._num_remote_buffers
+        return output
+
+    def release_buffer(self, timeout: Optional[float] = None):
+        # A single channel is not supposed to read and write at the same time.
+        assert self._next_write_index == 0
+        self._buffers[self._next_read_index].release_buffer(timeout)
+        self._next_read_index = (self._next_read_index + 1) % self._num_remote_buffers
+
+    def close(self) -> None:
+        for buffer in self._buffers:
+            buffer.close()
+
+    @property
+    def next_write_index(self):
+        # Testing only
+        return self._next_write_index
+
+    @property
+    def next_read_index(self):
+        # Testing only
+        return self._next_read_index
+
+
 @PublicAPI(stability="alpha")
 class CompositeChannel(ChannelInterface):
     """
@@ -725,11 +792,28 @@ class CompositeChannel(ChannelInterface):
                 self._channel_dict[actor_id] = remote_channel
 
         if len(readers_different_node) != 0:
-            remote_channel = Channel(self._writer, readers_different_node)
-            self._channels.add(remote_channel)
-            for reader, _ in readers_different_node:
-                actor_id = self._get_actor_id(reader)
-                self._channel_dict[actor_id] = remote_channel
+            # Enable multi-slot remote channeling when configured.
+            try:
+                from ray.dag import DAGContext
+
+                num_remote_buffers = max(1, DAGContext.get_current().num_remote_buffers)
+            except Exception:
+                num_remote_buffers = 1
+
+            if num_remote_buffers > 1:
+                remote_channel = RemoteChannelPool(
+                    self._writer, readers_different_node, num_remote_buffers
+                )
+                self._channels.add(remote_channel)
+                for reader, _ in readers_different_node:
+                    actor_id = self._get_actor_id(reader)
+                    self._channel_dict[actor_id] = remote_channel
+            else:
+                remote_channel = Channel(self._writer, readers_different_node)
+                self._channels.add(remote_channel)
+                for reader, _ in readers_different_node:
+                    actor_id = self._get_actor_id(reader)
+                    self._channel_dict[actor_id] = remote_channel
 
     def _get_actor_id(self, reader: ray.actor.ActorHandle) -> str:
         return reader._actor_id.hex()

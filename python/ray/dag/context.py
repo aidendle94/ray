@@ -31,6 +31,9 @@ DEFAULT_MAX_BUFFERED_RESULTS = int(
 DEFAULT_OVERLAP_GPU_COMMUNICATION = bool(
     os.environ.get("RAY_CGRAPH_overlap_gpu_communication", 0)
 )
+DEFAULT_NUM_REMOTE_BUFFERS = int(
+    os.environ.get("RAY_CGRAPH_num_remote_buffers", 1)
+)
 
 
 @DeveloperAPI
@@ -83,6 +86,9 @@ class DAGContext:
     max_inflight_executions: int = DEFAULT_MAX_INFLIGHT_EXECUTIONS
     max_buffered_results: int = DEFAULT_MAX_BUFFERED_RESULTS
     overlap_gpu_communication: bool = DEFAULT_OVERLAP_GPU_COMMUNICATION
+    # Number of per-edge remote buffers (slots) for cross-node channels.
+    # 1 preserves current behavior; >1 enables striped remote channels.
+    num_remote_buffers: int = DEFAULT_NUM_REMOTE_BUFFERS
 
     def __post_init__(self):
         if self.read_iteration_timeout > self.get_timeout:
